@@ -35,7 +35,6 @@ Write-Host "A iniciar o script de atualização de proxies..." -ForegroundColor 
 # --- INICIALIZAÇÃO ---
 $existingProxies = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 if (Test-Path $liveFile) {
-    # (A CORREÇÃO) Redireciona o output de 'Add' para $null para silenciar o 'True'
     Get-Content $liveFile | ForEach-Object { $existingProxies.Add($_) > $null }
 }
 Write-Host "[$((Get-Date).ToString("HH:mm:ss"))] Carregados $($existingProxies.Count) proxies existentes do '$liveFile'."
@@ -49,43 +48,11 @@ while ($true) {
         # --- FASE 1: RECOLHA RÁPIDA DE PROXIES (PARALELA) ---
         Write-Host "[$timestamp] A recolher novas fontes de proxies..."
         
-        $downloadScriptBlock = {
-            param($url, $protocol, $headers)
-            try {
-                $response = Invoke-WebRequest -Uri $url -UseBasicParsing -Headers $headers -TimeoutSec 20
-                return $response.Content.Split([Environment]::NewLine) | Where-Object { $_.Trim() -ne "" }
-            } catch {}
-            return $null
-        }
-
-        $downloadPool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $downloadThreadCount)
-        $downloadPool.Open()
+        $downloadScriptBlock = { param($url, $protocol, $headers); try { $response = Invoke-WebRequest -Uri $url -UseBasicParsing -Headers $headers -TimeoutSec 20; return $response.Content.Split([Environment]::NewLine) | Where-Object { $_.Trim() -ne "" } } catch {}; return $null }
+        $downloadPool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $downloadThreadCount); $downloadPool.Open()
         $downloadJobs = [System.Collections.Generic.List[object]]::new()
-
-        foreach ($protocol in $proxySources.Keys) {
-            foreach ($url in $proxySources[$protocol]) {
-                $ps = [System.Management.Automation.PowerShell]::Create()
-                $ps.RunspacePool = $downloadPool
-                $ps.AddScript($downloadScriptBlock).AddArgument($url).AddArgument($protocol).AddArgument($headers) | Out-Null
-                $jobInfo = [PSCustomObject]@{ Instance = $ps; Handle = $ps.BeginInvoke(); Protocol = $protocol }
-                $downloadJobs.Add($jobInfo)
-            }
-        }
-        
-        foreach ($job in $downloadJobs) {
-            $proxiesFromJob = $job.Instance.EndInvoke($job.Handle)
-            if ($proxiesFromJob) {
-                foreach ($proxy in $proxiesFromJob) {
-                    $formattedProxy = $proxy.Trim()
-                    if ($job.Protocol -ne "http" -and $formattedProxy -notlike "*://*") {
-                        $allProxies.Add("$($job.Protocol)://$formattedProxy")
-                    } else {
-                        $allProxies.Add($formattedProxy)
-                    }
-                }
-            }
-            $job.Instance.Dispose()
-        }
+        foreach ($protocol in $proxySources.Keys) { foreach ($url in $proxySources[$protocol]) { $ps = [System.Management.Automation.PowerShell]::Create(); $ps.RunspacePool = $downloadPool; $ps.AddScript($downloadScriptBlock).AddArgument($url).AddArgument($protocol).AddArgument($headers) | Out-Null; $jobInfo = [PSCustomObject]@{ Instance = $ps; Handle = $ps.BeginInvoke(); Protocol = $protocol }; $downloadJobs.Add($jobInfo) } }
+        foreach ($job in $downloadJobs) { $proxiesFromJob = $job.Instance.EndInvoke($job.Handle); if ($proxiesFromJob) { foreach ($proxy in $proxiesFromJob) { $formattedProxy = $proxy.Trim(); if ($job.Protocol -ne "http" -and $formattedProxy -notlike "*://*") { $allProxies.Add("$($job.Protocol)://$formattedProxy") } else { $allProxies.Add($formattedProxy) } } }; $job.Instance.Dispose() }
         $downloadPool.Close(); $downloadPool.Dispose()
         
         $newUniqueProxies = $allProxies.ToArray() | Where-Object { -not $existingProxies.Contains($_) } | Sort-Object -Unique
@@ -101,8 +68,11 @@ while ($true) {
 
             if (Test-Path $tempLiveFile) {
                 $validatedProxies = Get-Content $tempLiveFile
-                $validatedProxies | Add-Content -Path $liveFile
-                # (A CORREÇÃO) Silencia o output aqui também, por segurança
+                
+                # (A CORREÇÃO) Usa Add-Content para adicionar os novos proxies ao ficheiro principal
+                Add-Content -Path $liveFile -Value $validatedProxies
+                
+                # Atualiza o HashSet na memória
                 $validatedProxies | ForEach-Object { $existingProxies.Add($_) > $null }
                 
                 $countAdded = $validatedProxies.Count
@@ -119,6 +89,6 @@ while ($true) {
     }
 
     # --- ESPERAR ---
-    Write-Host "A aguardar 1 segundos para o próximo ciclo..."
+    Write-Host "A aguardar 1 segundo para o próximo ciclo..."
     Start-Sleep -Seconds 1
 }
