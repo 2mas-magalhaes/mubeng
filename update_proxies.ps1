@@ -21,16 +21,24 @@ $proxySources = @{
         "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt", "https://raw.githubusercontent.com/BreakingTechFr/Proxy_Free/main/proxies/socks5.txt",
         "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/socks5.txt", "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5/data.txt",
         "https://yakumo.rei.my.id/SOCKS5", "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/socks5.txt",
-        "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/socks5/socks5.txt", "https://sunny9577.github.io/proxy-scraper/generated/socks5_proxies.txt",
-        "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt"
+        "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/socks5/socks5.txt",
+        "https://sunny9577.github.io/proxy-scraper/generated/socks5_proxies.txt", "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt"
     )
 }
 
 $downloadThreadCount = 5
 $liveFile = "live.txt"
-$combinedFile = "proxies_combined.txt"
+$tempLiveFile = "live_temp.txt"
 
 Write-Host "A iniciar o script de atualização de proxies..." -ForegroundColor Green
+
+# --- INICIALIZAÇÃO ---
+$existingProxies = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+if (Test-Path $liveFile) {
+    # (A CORREÇÃO) Redireciona o output de 'Add' para $null para silenciar o 'True'
+    Get-Content $liveFile | ForEach-Object { $existingProxies.Add($_) > $null }
+}
+Write-Host "[$((Get-Date).ToString("HH:mm:ss"))] Carregados $($existingProxies.Count) proxies existentes do '$liveFile'."
 
 # --- LOOP INFINITO ---
 while ($true) {
@@ -39,13 +47,12 @@ while ($true) {
         $allProxies = [System.Collections.Concurrent.ConcurrentBag[string]]::new()
 
         # --- FASE 1: RECOLHA RÁPIDA DE PROXIES (PARALELA) ---
-        Write-Host "[$timestamp] A recolher proxies de $($proxySources.Keys.Count) tipos de fontes..."
+        Write-Host "[$timestamp] A recolher novas fontes de proxies..."
         
         $downloadScriptBlock = {
             param($url, $protocol, $headers)
             try {
                 $response = Invoke-WebRequest -Uri $url -UseBasicParsing -Headers $headers -TimeoutSec 20
-                # Retorna uma lista de strings limpas
                 return $response.Content.Split([Environment]::NewLine) | Where-Object { $_.Trim() -ne "" }
             } catch {}
             return $null
@@ -53,7 +60,7 @@ while ($true) {
 
         $downloadPool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $downloadThreadCount)
         $downloadPool.Open()
-        $downloadJobs = New-Object System.Collections.Generic.List[object]
+        $downloadJobs = [System.Collections.Generic.List[object]]::new()
 
         foreach ($protocol in $proxySources.Keys) {
             foreach ($url in $proxySources[$protocol]) {
@@ -65,11 +72,9 @@ while ($true) {
             }
         }
         
-        Write-Host "[$timestamp] A executar $($downloadJobs.Count) downloads em paralelo..."
         foreach ($job in $downloadJobs) {
             $proxiesFromJob = $job.Instance.EndInvoke($job.Handle)
             if ($proxiesFromJob) {
-                # (A CORREÇÃO) Adiciona o prefixo de protocolo aqui, depois de receber os resultados
                 foreach ($proxy in $proxiesFromJob) {
                     $formattedProxy = $proxy.Trim()
                     if ($job.Protocol -ne "http" -and $formattedProxy -notlike "*://*") {
@@ -82,26 +87,32 @@ while ($true) {
             $job.Instance.Dispose()
         }
         $downloadPool.Close(); $downloadPool.Dispose()
-
-        $uniqueProxies = $allProxies.ToArray() | Sort-Object -Unique
-        Write-Host "[$timestamp] Downloads concluídos. Obtidos $($uniqueProxies.Count) proxies únicos."
-
-        # --- FASE 2: VERIFICAÇÃO EM BLOCO (MÉTODO FIÁVEL) ---
-        if (Test-Path $combinedFile) { Remove-Item $combinedFile }
-        $uniqueProxies | Out-File -FilePath $combinedFile -Encoding utf8
         
-        if (Test-Path $liveFile) { Remove-Item $liveFile }
-        Write-Host "[$timestamp] A verificar $($uniqueProxies.Count) proxies (timeout de 1200ms)..."
-        
-        # Usa o mubeng para verificar a lista completa de uma só vez
-        mubeng -f $combinedFile -c -o $liveFile --timeout 1200ms
+        $newUniqueProxies = $allProxies.ToArray() | Where-Object { -not $existingProxies.Contains($_) } | Sort-Object -Unique
+        Write-Host "[$timestamp] Recolha concluída. Encontrados $($newUniqueProxies.Count) proxies novos para verificar."
 
-        if (Test-Path $liveFile) {
-            $lineCount = (Get-Content $liveFile | Measure-Object -Line).Lines
-            Write-Host "[$timestamp] Verificação completa. $lineCount proxies rápidos guardados em '$live.txt'." -ForegroundColor Green
-        } else {
-            Write-Host "[$timestamp] Verificação completa. Nenhum proxy rápido foi encontrado." -ForegroundColor Yellow
+        # --- FASE 2: VERIFICAÇÃO E ADIÇÃO ---
+        if ($newUniqueProxies.Count -gt 0) {
+            $newUniqueProxies | Out-File -FilePath "proxies_to_check.txt" -Encoding utf8
+            if (Test-Path $tempLiveFile) { Remove-Item $tempLiveFile }
+            Write-Host "[$timestamp] A verificar os proxies novos (timeout de 1500ms)..."
+            
+            mubeng -f "proxies_to_check.txt" -c -o $tempLiveFile --timeout 1500ms
+
+            if (Test-Path $tempLiveFile) {
+                $validatedProxies = Get-Content $tempLiveFile
+                $validatedProxies | Add-Content -Path $liveFile
+                # (A CORREÇÃO) Silencia o output aqui também, por segurança
+                $validatedProxies | ForEach-Object { $existingProxies.Add($_) > $null }
+                
+                $countAdded = $validatedProxies.Count
+                Write-Host "[$timestamp] Verificação concluída. Adicionados $countAdded proxies novos ao '$liveFile'." -ForegroundColor Green
+            } else {
+                Write-Host "[$timestamp] Verificação concluída. Nenhum proxy novo passou na verificação." -ForegroundColor Yellow
+            }
         }
+
+        Write-Host "[$timestamp] Total de proxies em '$liveFile': $($existingProxies.Count)." -ForegroundColor Cyan
 
     } catch {
         Write-Host "[$timestamp] Ocorreu um erro geral no script: $($_.Exception.Message)" -ForegroundColor Red
