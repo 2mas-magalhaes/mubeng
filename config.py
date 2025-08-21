@@ -5,7 +5,7 @@
 # --- (Estas variáveis serão ignoradas pelo checker) ---
 # =======================================================
 
-REQUESTS_PER_PROXY = 23
+REQUESTS_PER_PROXY = 22
 COOLDOWN_TIME_SECONDS = 301  # 5 minutos
 
 
