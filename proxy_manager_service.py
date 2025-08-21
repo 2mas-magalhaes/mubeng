@@ -20,10 +20,10 @@ from models import Proxy
 # --- CONFIGURAÇÃO PRINCIPAL ---
 DATA_FILE = r".\steam_live.txt"
 COOLDOWN_PROXIES_FILE = "cooldown_proxies.txt"
-RELOAD_INTERVAL_SECONDS = 60
-COOLDOWN_FILE_UPDATE_INTERVAL_SECONDS = 5
+RELOAD_INTERVAL_SECONDS = 8
+COOLDOWN_FILE_UPDATE_INTERVAL_SECONDS = 5 
 
-# --- LÓGICA DO PROXY POOL (igual à anterior) ---
+# --- LÓGICA DO PROXY POOL ---
 
 def load_proxies_from_text_file(file_path: str) -> List[Proxy]:
     """
@@ -61,13 +61,15 @@ class ProxyPool:
         self.data_file = data_file
         self.proxies: Dict[str, Proxy] = {}
         self.session_proxy_map: Dict[str, str] = {}
+        self.lock = threading.Lock()  # Lock para garantir a atomicidade na obtenção de proxies
         self.load_proxies()
 
     def load_proxies(self):
         loaded_proxies = load_proxies_from_text_file(self.data_file)
         new_proxies_map = {f"{p.ip}:{p.port}:{p.protocol}": p for p in loaded_proxies}
-        for key, proxy in new_proxies_map.items():
+        for key in new_proxies_map:
             if key in self.proxies:
+                # Mantém o estado atual (cooldown, falhas) do proxy se ele já existir
                 new_proxies_map[key] = self.proxies[key]
         self.proxies = new_proxies_map
         print(f"({datetime.now().strftime('%Y-%m-%d %H:%M:%S')}) Proxies carregados/recarregados. Total no pool: {len(self.proxies)}")
@@ -79,39 +81,54 @@ class ProxyPool:
         return [p for p in self.proxies.values() if not p.is_active()]
 
     def get_proxy(self, session_id: str) -> Optional[Proxy]:
-        if session_id in self.session_proxy_map:
-            proxy_key = self.session_proxy_map[session_id]
-            if proxy_key in self.proxies:
-                proxy = self.proxies[proxy_key]
-                if proxy.is_active() and proxy.requests_served < REQUESTS_PER_PROXY:
-                    return proxy
-        
-        available_proxies = self.get_available_proxies()
-        if not available_proxies:
-            return None
-        
-        new_proxy = available_proxies[0]
-        new_proxy_key = f"{new_proxy.ip}:{new_proxy.port}:{new_proxy.protocol}"
-        print(f"({datetime.now().strftime('%Y-%m-%d %H:%M:%S')}) LOG: Rotação de proxy para a sessão '{session_id}'. Novo proxy: {new_proxy_key}")
-        self.session_proxy_map[session_id] = new_proxy_key
-        return new_proxy
+        # O lock garante que apenas um thread pode executar este bloco de cada vez,
+        # prevenindo que dois pedidos recebam o mesmo proxy simultaneamente.
+        with self.lock:
+            # Tenta manter o proxy da sessão se ainda for válido
+            if session_id in self.session_proxy_map:
+                proxy_key = self.session_proxy_map[session_id]
+                if proxy_key in self.proxies:
+                    proxy = self.proxies[proxy_key]
+                    if proxy.is_active() and proxy.requests_served < REQUESTS_PER_PROXY:
+                        proxy.requests_served += 1 # Incrementar o uso
+                        return proxy
+            
+            # Se não, procura um novo proxy
+            available_proxies = self.get_available_proxies()
+            if not available_proxies:
+                return None
+            
+            # Lógica simples: pegar no primeiro disponível
+            new_proxy = available_proxies[0]
+            
+            # Marcar o proxy como "usado" imediatamente para que o próximo pedido não o apanhe
+            new_proxy.requests_served += 1
+
+            new_proxy_key = f"{new_proxy.ip}:{new_proxy.port}:{new_proxy.protocol}"
+            print(f"({datetime.now().strftime('%Y-%m-%d %H:%M:%S')}) LOG: Rotação de proxy para a sessão '{session_id}'. Novo proxy: {new_proxy_key}")
+            self.session_proxy_map[session_id] = new_proxy_key
+            return new_proxy
 
     def report_proxy_usage(self, proxy_key: str, success: bool):
         if proxy_key not in self.proxies:
             return
+        
         proxy = self.proxies[proxy_key]
+
         if not success:
             proxy.mark_failed()
             proxy.cooldown_until = datetime.now() + timedelta(seconds=COOLDOWN_TIME_SECONDS)
-            print(f"({datetime.now().strftime('%Y-%m-%d %H:%M:%S')}) LOG: Proxy {proxy_key} reportado com FALHA. A entrar em cooldown por {COOLDOWN_TIME_SECONDS}s. O próximo pedido irá forçar uma rotação.")
+            print(f"({datetime.now().strftime('%Y-%m-%d %H:%M:%S')}) LOG: Proxy {proxy_key} reportado com FALHA. A entrar em cooldown.")
             return
         
+        # Se sucesso, resetar o contador de falhas
         proxy.reset_failures()
-        proxy.requests_served += 1
+        
+        # Verificar se atingiu o limite de pedidos
         if proxy.requests_served >= REQUESTS_PER_PROXY:
             proxy.cooldown_until = datetime.now() + timedelta(seconds=COOLDOWN_TIME_SECONDS)
-            proxy.requests_served = 0
-            print(f"({datetime.now().strftime('%Y-%m-%d %H:%M:%S')}) LOG: Proxy {proxy_key} atingiu o limite de {REQUESTS_PER_PROXY} pedidos e entrou em cooldown por {COOLDOWN_TIME_SECONDS}s.")
+            proxy.requests_served = 0 # Resetar para a próxima utilização
+            print(f"({datetime.now().strftime('%Y-%m-%d %H:%M:%S')}) LOG: Proxy {proxy_key} atingiu o limite de {REQUESTS_PER_PROXY} pedidos e entrou em cooldown.")
 
 proxy_pool = ProxyPool(DATA_FILE)
 
@@ -136,11 +153,10 @@ def _update_cooldown_file_periodically():
         except Exception as e:
             print(f"({datetime.now().strftime('%Y-%m-%d %H:%M:%S')}) ERRO: Falha ao escrever no ficheiro de cooldown '{COOLDOWN_PROXIES_FILE}': {e}")
 
-# --- NOVA ABORDAGEM: GESTOR DE CICLO DE VIDA (LIFESPAN) ---
+# --- GESTOR DE CICLO DE VIDA (LIFESPAN) ---
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Código a ser executado no arranque da aplicação
     print("INFO: A iniciar tarefas de fundo (recarregamento de proxies e escrita de cooldown).")
     
     reload_thread = threading.Thread(target=_reload_proxies_periodically, daemon=True)
@@ -149,15 +165,14 @@ async def lifespan(app: FastAPI):
     cooldown_thread = threading.Thread(target=_update_cooldown_file_periodically, daemon=True)
     cooldown_thread.start()
     
-    yield # A aplicação fica ativa aqui
+    yield
     
-    # Código a ser executado no encerramento (opcional)
     print("INFO: Aplicação a terminar.")
 
 # --- INICIALIZAÇÃO DA APLICAÇÃO FASTAPI ---
 app = FastAPI(lifespan=lifespan)
 
-# --- MODELOS E ENDPOINTS DA API (iguais ao anterior) ---
+# --- MODELOS E ENDPOINTS DA API ---
 
 class AcquireProxyResponse(BaseModel):
     ip: str
