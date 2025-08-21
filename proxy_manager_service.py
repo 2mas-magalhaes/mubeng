@@ -108,8 +108,8 @@ class ProxyPool:
         if not success:
             proxy.mark_failed()
             print(f"Proxy {proxy_key} reportado com falha. Falhas: {proxy.failures}")
-            # Se falhar 3 vezes, entra em cooldown longo
-            if proxy.failures >= 3:
+            # Se falhar 1 vezes, entra em cooldown longo
+            if proxy.failures >= 1:
                  proxy.cooldown_until = datetime.now() + timedelta(hours=1)
                  print(f"Proxy {proxy_key} colocado em cooldown longo devido a falhas.")
             return
