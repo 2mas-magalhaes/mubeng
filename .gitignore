@@ -3,3 +3,4 @@ dist/*
 *.txt
 *.crt
 *.key
+steam_debug_api.log
